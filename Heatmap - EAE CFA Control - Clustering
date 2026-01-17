@@ -1,0 +1,445 @@
+# =========================================================
+# DESeq2-normalized Excel (Family) [Sheet2] -> log2FC Heatmap (CFA/EAE)
+# - Sheet2(두 번째 시트; 보통 "Family_DESeq2_normCounts")를 그대로 사용
+# - log2FC = log2((mean_group + pseudo)/(mean_control + pseudo))
+# - 유의성(별표) = raw p-value(t-test) 기반 (log2(x+pseudo))
+# - Heatmap 셀 내부 *,**,*** 표시 + border_color="black"
+# - ✅ CFA & EAE 모두 감소(Both Down) 항목을 "TOP"으로 따로 모아 표시 + 별도 CSV 저장
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(pheatmap)
+  library(grid)
+  library(openxlsx)
+})
+
+# -------------------------
+# Input / Output
+# -------------------------
+in_file  <- file.path("26.01.14 Count Normalization.Family", "DEG2 Nor Taxonomy_abundance_count.xlsx")
+out_dir  <- "26.01.14 - normalized_heatmap"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_xlsx           <- file.path(out_dir, "Family_normalized_log2FC_stats.xlsx")
+out_all_csv        <- file.path(out_dir, "Family_log2FC_pval.all.csv")
+out_filtered_csv   <- file.path(out_dir, "Family_log2FC_pval.filtered.ordered.DOWNTOP.csv")
+out_both_down_csv  <- file.path(out_dir, "Family_BothDown_CFA_and_EAE.csv")
+out_tiff           <- file.path(out_dir, "Family_log2FC_left_CFA_right_EAE.DOWNTOP.tiff")
+
+# -------------------------
+# Sheet selection: Sheet2 강제
+# -------------------------
+stopifnot(file.exists(in_file))
+sheets <- readxl::excel_sheets(in_file)
+
+# 보통 DESeq2 정규화 시트명은 "Family_DESeq2_normCounts"일 가능성이 높음
+sheet_nm <- if ("Family_DESeq2_normCounts" %in% sheets) "Family_DESeq2_normCounts" else sheets[2]
+message("Using sheet: ", sheet_nm)
+
+# -------------------------
+# Parameters
+# -------------------------
+lfc_cut_display <- 0
+keep_rule <- "either"     # "either" or "both"
+require_both <- TRUE
+
+stable_cut <- 1.2
+white_cut  <- 1
+
+border_col   <- "black"   # ✅ black border
+pseudo_count <- 1         # 0값 회피용
+do_ttest     <- TRUE      # ✅ raw p-value 계산(별표용)
+
+# raw p-value cutoffs for stars
+sig_cut1 <- 0.05
+sig_cut2 <- 0.01
+sig_cut3 <- 0.001
+
+colname_left  <- "CFA/PTX vs Control"
+colname_right <- "EAE vs Control"
+
+drop_both_stable <- TRUE
+down_always_top  <- TRUE
+
+# -------------------------
+# Utils
+# -------------------------
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+pretty_family <- function(x){
+  x <- as.character(x)
+  x <- gsub("^__+", "", x)
+  x <- gsub("[._-]\\d+$", "", x)
+  x <- gsub("^_+$", "", x)
+  trimws(x)
+}
+
+z <- function(x){
+  x <- as.numeric(x)
+  m <- mean(x, na.rm = TRUE)
+  s <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(x - m)
+  (x - m) / s
+}
+
+dir3 <- function(x, stable_cut){
+  dplyr::case_when(
+    !is.finite(x) ~ NA_character_,
+    x >=  stable_cut ~ "Up",
+    x <= -stable_cut ~ "Down",
+    TRUE ~ "Stable"
+  )
+}
+
+open_screen_device_if_needed <- function(width=7.8, height=8){
+  if (grDevices::dev.cur() == 1L) grDevices::dev.new(width = width, height = height)
+}
+
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+row_ttest_p <- function(x, grpA_idx, grpB_idx){
+  a <- x[grpA_idx]; b <- x[grpB_idx]
+  if (all(!is.finite(a)) || all(!is.finite(b))) return(NA_real_)
+  if (length(a) < 2 || length(b) < 2) return(NA_real_)
+  if (length(unique(a[is.finite(a)])) < 2 && length(unique(b[is.finite(b)])) < 2) return(NA_real_)
+  out <- try(stats::t.test(a, b), silent = TRUE)
+  if (inherits(out, "try-error")) return(NA_real_)
+  out$p.value
+}
+
+p_to_star <- function(p){
+  ifelse(!is.finite(p) | is.na(p), "",
+         ifelse(p < sig_cut3, "***",
+                ifelse(p < sig_cut2, "**",
+                       ifelse(p < sig_cut1, "*", ""))))
+}
+
+ord_by_num <- function(cols){
+  # "Control 1", "Control1" 모두 처리
+  x <- str_replace_all(cols, "\\s+", "")
+  idx <- suppressWarnings(as.integer(str_extract(x, "\\d+$")))
+  cols[order(idx)]
+}
+
+# -------------------------
+# 1) Load Excel (Sheet2 = DESeq2 normalized counts)
+# -------------------------
+raw_tbl <- readxl::read_excel(in_file, sheet = sheet_nm)
+raw <- as.data.frame(raw_tbl, stringsAsFactors = FALSE)
+
+# -------------------------
+# 2) taxonomy columns 대응 (파일 형태 유연)
+# -------------------------
+if (!("Family_id" %in% names(raw))) {
+  fam_col <- if ("Family" %in% names(raw)) "Family" else names(raw)[1]
+  fam_raw <- as.character(raw[[fam_col]])
+  disp <- pretty_family(fam_raw)
+  
+  keep_mask <- nzchar(disp) & !is.na(disp)
+  raw <- raw[keep_mask, , drop = FALSE]
+  fam_raw <- fam_raw[keep_mask]
+  disp <- disp[keep_mask]
+  
+  fam_raw[is.na(fam_raw) | fam_raw == ""] <- disp[is.na(fam_raw) | fam_raw == ""]
+  family_id <- make.unique(paste0("F_", seq_along(fam_raw), "_", fam_raw))
+  
+  raw$Family_id  <- family_id
+  raw$Family_raw <- fam_raw
+  raw$Display    <- disp
+}
+
+if (!("Family_raw" %in% names(raw))) raw$Family_raw <- as.character(raw$Family %||% raw$Family_id)
+if (!("Display" %in% names(raw)))    raw$Display    <- pretty_family(raw$Family_raw %||% raw$Family_id)
+
+# -------------------------
+# 3) sample columns auto-detect (공백 허용)
+# -------------------------
+ctrl_cols <- grep("^(Con?tol|Control)\\s*\\d+$", names(raw), ignore.case = TRUE, value = TRUE)
+cfa_cols  <- grep("^CFA\\s*\\d+$",              names(raw), ignore.case = TRUE, value = TRUE)
+eae_cols  <- grep("^EAE\\s*\\d+$",              names(raw), ignore.case = TRUE, value = TRUE)
+
+if (length(ctrl_cols) == 0) stop("Control 컬럼 못 찾음 (예: Contol1~4 또는 Control 1~4)")
+if (length(cfa_cols)  == 0) stop("CFA 컬럼 못 찾음 (예: CFA1~4 또는 CFA 1~4)")
+if (length(eae_cols)  == 0) stop("EAE 컬럼 못 찾음 (예: EAE1~4 또는 EAE 1~4)")
+
+ctrl_cols <- ord_by_num(ctrl_cols)
+cfa_cols  <- ord_by_num(cfa_cols)
+eae_cols  <- ord_by_num(eae_cols)
+
+sample_cols <- c(ctrl_cols, cfa_cols, eae_cols)
+
+# -------------------------
+# 4) Build normalized matrix (Sheet2 값을 그대로 사용)
+# -------------------------
+cnt_df <- raw[, sample_cols, drop = FALSE]
+for (cc in names(cnt_df)) cnt_df[[cc]] <- to_num(cnt_df[[cc]])
+cnt_df[is.na(cnt_df)] <- 0
+
+mat_norm <- as.matrix(cnt_df)
+colnames(mat_norm) <- sample_cols
+
+rid <- as.character(raw$Family_id)
+rid[is.na(rid) | rid == ""] <- paste0("Row_", seq_along(rid))
+rid <- make.unique(rid)
+rownames(mat_norm) <- rid
+
+display <- as.character(raw$Display)
+display[is.na(display) | display == ""] <- rid
+
+# -------------------------
+# 5) Means + log2FC (normalized 기반)
+# -------------------------
+grp <- c(rep("Control", length(ctrl_cols)), rep("CFA", length(cfa_cols)), rep("EAE", length(eae_cols)))
+grp <- factor(grp, levels = c("Control","CFA","EAE"))
+
+ctrl_idx <- which(grp == "Control")
+cfa_idx  <- which(grp == "CFA")
+eae_idx  <- which(grp == "EAE")
+
+if (length(ctrl_idx) < 2 || length(cfa_idx) < 2 || length(eae_idx) < 2) {
+  stop("t-test를 위해 각 그룹에 최소 2개 이상의 샘플이 필요합니다.")
+}
+
+ctrl_mean <- rowMeans(mat_norm[, ctrl_idx, drop=FALSE], na.rm = TRUE)
+cfa_mean  <- rowMeans(mat_norm[, cfa_idx,  drop=FALSE], na.rm = TRUE)
+eae_mean  <- rowMeans(mat_norm[, eae_idx,  drop=FALSE], na.rm = TRUE)
+
+log2FC_CFA <- log2((cfa_mean + pseudo_count) / (ctrl_mean + pseudo_count))
+log2FC_EAE <- log2((eae_mean + pseudo_count) / (ctrl_mean + pseudo_count))
+
+# -------------------------
+# 6) raw p-value (t-test) on log2(x+pseudo)
+# -------------------------
+pval_CFA <- pval_EAE <- rep(NA_real_, nrow(mat_norm))
+if (isTRUE(do_ttest)) {
+  mat_log <- log2(mat_norm + pseudo_count)
+  pval_CFA <- apply(mat_log, 1, row_ttest_p, grpA_idx = cfa_idx, grpB_idx = ctrl_idx)
+  pval_EAE <- apply(mat_log, 1, row_ttest_p, grpA_idx = eae_idx, grpB_idx = ctrl_idx)
+}
+
+df <- tibble::tibble(
+  Family_id  = rid,
+  Family_raw = as.character(raw$Family_raw),
+  Display    = display,
+  Control_mean_norm = as.numeric(ctrl_mean),
+  CFA_mean_norm     = as.numeric(cfa_mean),
+  EAE_mean_norm     = as.numeric(eae_mean),
+  log2FC_CFA = as.numeric(log2FC_CFA),
+  pval_CFA   = as.numeric(pval_CFA),
+  log2FC_EAE = as.numeric(log2FC_EAE),
+  pval_EAE   = as.numeric(pval_EAE)
+)
+
+write.csv(df, out_all_csv, row.names = FALSE)
+
+# -------------------------
+# 7) Excel export
+# -------------------------
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "Family_norm_input")
+openxlsx::writeData(
+  wb, "Family_norm_input",
+  cbind(
+    data.frame(Family_id=rid, Family_raw=df$Family_raw, Display=df$Display, stringsAsFactors=FALSE),
+    as.data.frame(mat_norm)
+  )
+)
+
+openxlsx::addWorksheet(wb, "Stats_all")
+openxlsx::writeData(wb, "Stats_all", df)
+
+openxlsx::saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+# -------------------------
+# 8) Heatmap filter + BoxFinal (BothDown -> TOP)
+# -------------------------
+df_f <- df %>%
+  filter(is.finite(log2FC_CFA) | is.finite(log2FC_EAE)) %>%
+  mutate(
+    pass_cfa = is.finite(log2FC_CFA) & abs(log2FC_CFA) >= lfc_cut_display,
+    pass_eae = is.finite(log2FC_EAE) & abs(log2FC_EAE) >= lfc_cut_display
+  ) %>%
+  filter(if (keep_rule == "both") (pass_cfa & pass_eae) else (pass_cfa | pass_eae)) %>%
+  select(-pass_cfa, -pass_eae)
+
+if (isTRUE(require_both)) {
+  df_f <- df_f %>% filter(is.finite(log2FC_CFA), is.finite(log2FC_EAE))
+}
+stopifnot(nrow(df_f) > 0)
+
+df_ord <- df_f %>%
+  mutate(
+    CFA_dir = factor(dir3(log2FC_CFA, stable_cut), levels = c("Up","Stable","Down")),
+    EAE_dir = factor(dir3(log2FC_EAE, stable_cut), levels = c("Up","Stable","Down")),
+    score   = z(log2FC_CFA) - z(log2FC_EAE),
+    
+    both_down = (CFA_dir == "Down") & (EAE_dir == "Down"),
+    any_down  = (CFA_dir == "Down") | (EAE_dir == "Down"),
+    both_up   = (CFA_dir == "Up")   & (EAE_dir == "Up"),
+    
+    BoxFinal = dplyr::case_when(
+      isTRUE(down_always_top) & both_down ~ "TOP) Both Down (CFA & EAE)",
+      isTRUE(down_always_top) & any_down  ~ "A) Any Down (CFA or EAE)",
+      both_up                               ~ "B) Both Up",
+      score >= 0                            ~ "C) CFA-high / EAE-low",
+      TRUE                                  ~ "D) CFA-low / EAE-high"
+    ),
+    BoxFinal = factor(
+      BoxFinal,
+      levels = c("TOP) Both Down (CFA & EAE)",
+                 "A) Any Down (CFA or EAE)",
+                 "B) Both Up",
+                 "C) CFA-high / EAE-low",
+                 "D) CFA-low / EAE-high")
+    ),
+    
+    .top_key = dplyr::case_when(
+      BoxFinal == "TOP) Both Down (CFA & EAE)" ~ pmax(-log2FC_CFA, -log2FC_EAE, na.rm = TRUE),
+      BoxFinal == "A) Any Down (CFA or EAE)"   ~ -pmin(log2FC_CFA, log2FC_EAE, na.rm = TRUE),
+      TRUE                                    ~ -Inf
+    )
+  ) %>%
+  { if (isTRUE(drop_both_stable)) dplyr::filter(., !(CFA_dir == "Stable" & EAE_dir == "Stable")) else . } %>%
+  arrange(BoxFinal, desc(.top_key), desc(abs(score)), desc(log2FC_CFA), log2FC_EAE, Display) %>%
+  select(-both_down, -any_down, -both_up, -.top_key)
+
+stopifnot(nrow(df_ord) > 0)
+
+# ✅ Both Down만 별도 저장
+df_both_down <- df_ord %>%
+  filter(CFA_dir == "Down", EAE_dir == "Down") %>%
+  arrange(log2FC_CFA, log2FC_EAE)
+
+write.csv(df_both_down, out_both_down_csv, row.names = FALSE)
+
+# gaps
+rle_box <- rle(as.character(df_ord$BoxFinal))
+ends <- cumsum(rle_box$lengths)
+gaps_row_idx <- ends[-length(ends)]
+if (length(gaps_row_idx) == 0) gaps_row_idx <- NULL
+
+write.csv(df_ord, out_filtered_csv, row.names = FALSE)
+
+# -------------------------
+# 9) Heatmap matrices (FC + raw p-value stars)
+# -------------------------
+safe_ids <- df_ord$Family_id
+safe_ids[is.na(safe_ids) | safe_ids == ""] <- paste0("Row_", seq_along(safe_ids))
+safe_ids <- make.unique(safe_ids)
+
+mat_fc <- cbind(df_ord$log2FC_CFA, df_ord$log2FC_EAE)
+rownames(mat_fc) <- safe_ids
+colnames(mat_fc) <- c(colname_left, colname_right)
+
+mat_star <- cbind(
+  p_to_star(df_ord$pval_CFA),
+  p_to_star(df_ord$pval_EAE)
+)
+rownames(mat_star) <- safe_ids
+colnames(mat_star) <- c(colname_left, colname_right)
+
+labels_row <- df_ord$Display
+labels_row[is.na(labels_row) | labels_row == ""] <- safe_ids
+
+ann_row <- data.frame(
+  Box = df_ord$BoxFinal,
+  CFA = df_ord$CFA_dir,
+  EAE = df_ord$EAE_dir
+)
+rownames(ann_row) <- safe_ids
+
+ann_colors <- list(
+  Box = c(
+    "TOP) Both Down (CFA & EAE)"   = "grey10",
+    "A) Any Down (CFA or EAE)"     = "grey35",
+    "B) Both Up"                   = "grey60",
+    "C) CFA-high / EAE-low"        = "grey78",
+    "D) CFA-low / EAE-high"        = "grey88"
+  ),
+  CFA = c(Up = "#c53030", Stable = "grey60", Down = "#2b6cb0"),
+  EAE = c(Up = "#c53030", Stable = "grey60", Down = "#2b6cb0")
+)
+
+fc_min <- floor(min(mat_fc, na.rm = TRUE))
+fc_max <- ceiling(max(mat_fc, na.rm = TRUE))
+
+n_neg <- 100; n_pos <- 100
+have_neg <- (fc_min < -white_cut)
+have_pos <- (fc_max >  white_cut)
+
+breaks <- c(
+  if (have_neg) seq(fc_min, -white_cut, length.out = n_neg + 1) else -white_cut,
+  white_cut,
+  if (have_pos) seq(white_cut, fc_max, length.out = n_pos + 1)[-1] else white_cut
+)
+
+colors <- c(
+  if (have_neg) colorRampPalette(c("blue","white"))(n_neg) else NULL,
+  "white",
+  if (have_pos) colorRampPalette(c("white","red"))(n_pos) else NULL
+)
+
+draw_heat <- function(mat, stars, file = NULL, legend_title = "log2FC (DESeq2 normalized means)"){
+  if (is.null(file)) {
+    open_screen_device_if_needed()
+  } else {
+    dpi <- 300
+    w_in <- 7.8
+    h_in <- 0.18*nrow(mat) + 2.8
+    grDevices::tiff(
+      filename = file,
+      width  = w_in, height = max(8, h_in),
+      units  = "in",
+      res    = dpi,
+      compression = "lzw"
+    )
+  }
+  
+  grid::grid.newpage()
+  
+  ph <- pheatmap::pheatmap(
+    mat,
+    color = colors, breaks = breaks,
+    cluster_rows = FALSE, cluster_cols = FALSE,
+    border_color = border_col,
+    main = sprintf(
+      "Family — log2FC (DESeq2 norm means) | stars=raw p-value | *<%.3g **<%.3g ***<%.3g | stable_cut=%.2f | white@±%.2f | pseudo=%.3g",
+      sig_cut1, sig_cut2, sig_cut3, stable_cut, white_cut, pseudo_count
+    ),
+    angle_col = 90,
+    labels_row = labels_row,
+    annotation_row = ann_row,
+    annotation_colors = ann_colors,
+    gaps_row = gaps_row_idx,
+    cellwidth = 32, cellheight = 10,
+    
+    display_numbers = stars,
+    number_color = "black",
+    fontsize_number = 10,
+    
+    silent = TRUE
+  )
+  
+  grid::grid.draw(ph$gtable)
+  
+  grid::grid.text(legend_title,
+                  x = grid::unit(0.95, "npc"), y = grid::unit(0.965, "npc"),
+                  just = c("right","top"),
+                  gp = grid::gpar(fontface = "bold", cex = 0.9))
+  
+  if (!is.null(file)) dev.off()
+  invisible(ph)
+}
+
+draw_heat(mat_fc, mat_star, file = NULL)
+draw_heat(mat_fc, mat_star, file = out_tiff)
+
+cat("Saved (XLSX)              : ", normalizePath(out_xlsx, winslash="/", mustWork = FALSE), "\n", sep = "")
+cat("Saved (ALL results CSV)    : ", normalizePath(out_all_csv, winslash="/", mustWork = FALSE), "\n", sep = "")
+cat("Saved (FILTERED CSV)       : ", normalizePath(out_filtered_csv, winslash="/", mustWork = FALSE), "\n", sep = "")
+cat("Saved (BOTH DOWN CSV)      : ", normalizePath(out_both_down_csv, winslash="/", mustWork = FALSE), "\n", sep = "")
+cat("Saved (HEATMAP TIFF)       : ", normalizePath(out_tiff, winslash="/", mustWork = FALSE), "\n", sep = "")
