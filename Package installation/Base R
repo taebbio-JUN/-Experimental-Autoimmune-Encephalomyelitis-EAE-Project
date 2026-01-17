@@ -1,0 +1,39 @@
+install.packages("renv")
+renv::init()
+renv::snapshot()
+
+# =========================
+# Save package versions for reproducibility
+# =========================
+
+pkgs <- c(
+  "readxl","dplyr","tidyr","stringr","tibble",
+  "ggplot2","vegan","openxlsx","pheatmap",
+  "DESeq2","gghalves","grid"
+)
+
+get_ver <- function(p) {
+  if (p %in% rownames(installed.packages())) as.character(packageVersion(p)) else NA_character_
+}
+
+ver_df <- data.frame(
+  Package = pkgs,
+  Version = vapply(pkgs, get_ver, character(1)),
+  stringsAsFactors = FALSE
+)
+
+write.csv(ver_df, "package_versions.csv", row.names = FALSE)
+
+# R / Bioconductor / session info also saved
+sink("sessionInfo.txt")
+cat("R version:", as.character(getRversion()), "\n")
+if (requireNamespace("BiocManager", quietly = TRUE)) {
+  cat("BiocManager version:", as.character(packageVersion("BiocManager")), "\n")
+  cat("Bioconductor version:", as.character(BiocManager::version()), "\n")
+}
+cat("\n--- sessionInfo() ---\n")
+print(sessionInfo())
+sink()
+
+message("Wrote: package_versions.csv")
+message("Wrote: sessionInfo.txt")
