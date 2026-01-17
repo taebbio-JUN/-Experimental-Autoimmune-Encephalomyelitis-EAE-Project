@@ -1,0 +1,253 @@
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(vegan)     # adonis2, betadisper, ordiellipse
+  library(openxlsx)  # export xlsx
+})
+
+set.seed(1)
+perm_n <- 9999
+
+# =========================
+# 0) 입력/출력 경로
+# =========================
+in_file  <- "Taxonomy_abundance_count.xlsx"
+out_dir  <- "26.01.14 redo"
+stopifnot(file.exists(in_file))
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# =========================
+# 1) Rank 선택 (시트 + 분류 컬럼명)
+# =========================
+rank_name <- "Family"   # "Family" 또는 "Genus"
+
+sheets <- excel_sheets(in_file)
+if (!(rank_name %in% sheets)) {
+  stop("엑셀에 '", rank_name, "' 시트가 없습니다. 존재하는 시트: ", paste(sheets, collapse = ", "))
+}
+raw <- read_excel(in_file, sheet = rank_name)
+
+# =========================
+# 2) count_mat 구성 (행=Taxon, 열=Sample)
+# =========================
+clean_name <- function(x) gsub("^_+", "", x)
+
+rank_col <- names(raw)[tolower(names(raw)) == tolower(rank_name)]
+if (length(rank_col) != 1) {
+  stop(rank_name, " 시트에 '", rank_name, "' 컬럼이 정확히 1개여야 합니다.")
+}
+
+is_numlike <- function(v){
+  vv <- suppressWarnings(as.numeric(v))
+  sum(!is.na(vv)) > 0
+}
+sample_cols <- setdiff(names(raw)[sapply(raw, is_numlike)], rank_col)
+if (length(sample_cols) == 0) {
+  stop("샘플(카운트) 컬럼을 찾지 못했습니다. ", rank_name, " 외 열이 숫자형인지 확인하세요.")
+}
+
+count_df <- raw %>%
+  transmute(
+    Taxon = clean_name(as.character(.data[[rank_col]])),
+    across(all_of(sample_cols), ~ suppressWarnings(as.numeric(.x)))
+  ) %>%
+  filter(!is.na(Taxon), Taxon != "") %>%
+  group_by(Taxon) %>%
+  summarise(across(all_of(sample_cols), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+count_mat <- as.matrix(count_df[, sample_cols, drop = FALSE])
+rownames(count_mat) <- count_df$Taxon
+count_mat <- count_mat[rowSums(count_mat) > 0, , drop = FALSE]  # all-zero 제거
+
+# =========================
+# 3) Group 메타데이터(샘플명에서 추론)
+# =========================
+standardize_group <- function(x){
+  x <- as.character(x)
+  x <- str_replace_all(x, "^Contol$", "Control")
+  case_when(
+    str_detect(toupper(x), "EAE") ~ "EAE",
+    str_detect(toupper(x), "CFA") ~ "CFA/PTX",
+    str_detect(toupper(x), "CTRL|CONTROL|CONTOL") ~ "Control",
+    TRUE ~ NA_character_
+  )
+}
+
+meta <- data.frame(Sample = colnames(count_mat), stringsAsFactors = FALSE) %>%
+  mutate(Group_raw = str_remove(Sample, "\\d+$"),
+         Group = standardize_group(Group_raw))
+
+if (any(is.na(meta$Group))) {
+  stop("Group이 NA인 샘플이 있습니다(샘플명 규칙 확인): ",
+       paste(meta$Sample[is.na(meta$Group)], collapse = ", "))
+}
+meta$Group <- factor(meta$Group, levels = c("Control","CFA/PTX","EAE"))
+
+# =========================
+# 4) Relative abundance → Aitchison(CLR+Euclid) → PCoA
+# =========================
+rel <- sweep(count_mat, 2, colSums(count_mat), "/")
+rel <- rel[rowSums(rel) > 0, , drop = FALSE]
+
+X <- t(rel)  # sample x taxon
+
+# pseudocount: 가장 작은 양수의 절반(없으면 1e-6)
+min_pos <- suppressWarnings(min(X[X > 0], na.rm = TRUE))
+pseudocount <- if (is.finite(min_pos) && min_pos > 0) min_pos/2 else 1e-6
+X_pc <- X + pseudocount
+
+# CLR (수동)
+gm <- exp(rowMeans(log(X_pc)))
+X_clr <- log(X_pc / gm)
+
+# Aitchison distance
+ait <- dist(X_clr, method = "euclidean")
+
+# PCoA
+pcoa <- cmdscale(ait, k = 2, eig = TRUE)
+eig <- pcoa$eig
+eig_pos <- eig[eig > 0]
+var_exp <- eig_pos / sum(eig_pos) * 100
+
+pcoa_df <- data.frame(
+  Sample = rownames(pcoa$points),
+  PCoA1  = pcoa$points[,1],
+  PCoA2  = pcoa$points[,2],
+  stringsAsFactors = FALSE
+) %>% left_join(meta, by = "Sample")
+
+# =========================
+# 5) 통계: PERMANOVA(adonis2) + betadisper (원본 거리로만)
+# =========================
+adon_overall <- adonis2(ait ~ Group, data = pcoa_df, permutations = perm_n)
+adon_row <- adon_overall[1, , drop = FALSE]
+
+bd <- betadisper(ait, pcoa_df$Group)
+bd_test <- permutest(bd, permutations = perm_n)
+bd_p <- bd_test$tab[1, "Pr(>F)"]
+bd_F <- bd_test$tab[1, "F"]
+
+pairwise_permanova <- function(dist_obj, df_meta, perm = 9999){
+  gr <- levels(droplevels(df_meta$Group))
+  pairs <- combn(gr, 2, simplify = FALSE)
+  out <- lapply(pairs, function(pp){
+    idx <- df_meta$Group %in% pp
+    dsub <- as.dist(as.matrix(dist_obj)[idx, idx])
+    msub <- droplevels(df_meta[idx, , drop = FALSE])
+    a <- adonis2(dsub ~ Group, data = msub, permutations = perm)
+    data.frame(
+      Comparison = paste(pp, collapse = " vs "),
+      Df = a$Df[1],
+      F  = a$F[1],
+      R2 = a$R2[1],
+      p  = a$`Pr(>F)`[1],
+      stringsAsFactors = FALSE
+    )
+  })
+  bind_rows(out) %>% mutate(p_BH = p.adjust(p, method = "BH"))
+}
+pair_df <- pairwise_permanova(ait, pcoa_df, perm = perm_n)
+
+n_df <- pcoa_df %>% count(Group, name = "n")
+
+# =========================
+# 6) Export: stats.xlsx (통계는 엑셀로만!)
+# =========================
+stats_overall <- data.frame(
+  Rank = rank_name,
+  Distance = paste0("Aitchison (CLR+Euclidean), pseudocount=", signif(pseudocount, 3)),
+  Control_n = n_df$n[n_df$Group == "Control"],
+  CFA_PTX_n = n_df$n[n_df$Group == "CFA/PTX"],
+  EAE_n     = n_df$n[n_df$Group == "EAE"],
+  PERMANOVA_Df = adon_row$Df,
+  PERMANOVA_F  = adon_row$F,
+  PERMANOVA_R2 = adon_row$R2,
+  PERMANOVA_p  = adon_row$`Pr(>F)`,
+  permutations = perm_n,
+  betadisper_F = bd_F,
+  betadisper_p = bd_p
+)
+
+out_xlsx <- file.path(out_dir, paste0("PCoA_", rank_name, "_Aitchison_PERMANOVA_stats.xlsx"))
+
+wb <- createWorkbook()
+addWorksheet(wb, "overall_PERMANOVA")
+addWorksheet(wb, "pairwise_PERMANOVA")
+addWorksheet(wb, "PCoA_points")
+writeData(wb, "overall_PERMANOVA", stats_overall)
+writeData(wb, "pairwise_PERMANOVA", pair_df)
+writeData(wb, "PCoA_points", pcoa_df)
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+# =========================
+# 7) Plot용 좌표만 그룹 간 간격 확장 (그림에만 적용)  <-- 이 부분 절대 삭제 X
+# =========================
+sep_factor <- 1.4  # 1=원본, 1.2~1.8 조절
+
+grand_c1 <- mean(pcoa_df$PCoA1)
+grand_c2 <- mean(pcoa_df$PCoA2)
+
+centroids <- pcoa_df %>%
+  group_by(Group) %>%
+  summarise(c1 = mean(PCoA1), c2 = mean(PCoA2), .groups = "drop") %>%
+  mutate(shift1 = (sep_factor - 1) * (c1 - grand_c1),
+         shift2 = (sep_factor - 1) * (c2 - grand_c2))
+
+pcoa_plot_df <- pcoa_df %>%
+  left_join(centroids %>% select(Group, shift1, shift2), by = "Group") %>%
+  mutate(PCoA1_plot = PCoA1 + shift1,
+         PCoA2_plot = PCoA2 + shift2)
+
+# =========================
+# 8) SD 타원(표준편차 타원) — plot 좌표 기준으로 계산/그림
+# =========================
+veganCovEllipse <- function(cov, center = c(0,0), scale = 1, npoints = 200){
+  theta  <- seq(0, 2*pi, length.out = npoints)
+  circle <- cbind(cos(theta), sin(theta))
+  pts <- t(center + scale * t(circle %*% chol(cov)))
+  pts
+}
+
+sd_scale <- 1.6  # 1=1SD, 1.6~2.0: 더 크게
+
+ord_plot <- as.matrix(pcoa_plot_df[, c("PCoA1_plot","PCoA2_plot")])
+ell <- vegan::ordiellipse(ord_plot, groups = pcoa_plot_df$Group, kind = "sd", draw = "none")
+
+ell_df <- do.call(rbind, lapply(names(ell), function(g){
+  pts <- veganCovEllipse(ell[[g]]$cov, center = ell[[g]]$center, scale = ell[[g]]$scale * sd_scale)
+  data.frame(PCoA1_plot = pts[,1], PCoA2_plot = pts[,2], Group = g)
+}))
+
+# =========================
+# 9) Plot 저장 (통계 박스 삭제 + 회색 그리드 삭제 = 흰 바탕)
+# =========================
+p <- ggplot(pcoa_plot_df, aes(PCoA1_plot, PCoA2_plot, color = Group)) +
+  geom_point(size = 2) +
+  geom_path(data = ell_df,
+            aes(PCoA1_plot, PCoA2_plot, color = Group),
+            linewidth = 1, inherit.aes = FALSE) +
+  labs(
+    title = paste0("PCoA (Aitchison: CLR+Euclidean) — ", rank_name),
+    x = sprintf("PCoA1 (%.1f%%)", var_exp[1]),
+    y = sprintf("PCoA2 (%.1f%%)", var_exp[2]),
+    color = "Group"
+  ) +
+  theme_classic(base_size = 16) +  # ✅ 회색 실선(그리드) 없음 + 흰 바탕
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1.1),
+    plot.title = element_text(face="bold", size=18),
+    axis.title = element_text(face="bold", size=18),
+    legend.title = element_text(face="bold")
+  )
+
+out_png <- file.path(out_dir, paste0("PCoA_", rank_name, "_Aitchison_SDellipse_WHITEBG.png"))
+ggsave(out_png, p, width = 11, height = 8, dpi = 300)
+
+message("Export folder: ", normalizePath(out_dir))
+message("Saved stats:   ", normalizePath(out_xlsx))
+message("Saved plot :   ", normalizePath(out_png))
+print(p)
