@@ -1,0 +1,467 @@
+# =========================================================
+# Genus Analysis (Family-selected)
+# -> DESeq2 (sfType="poscounts") normalization + DESeq2 contrasts
+# -> per-sample log2FC vs Control_mean (for plotting)
+# -> Effect filter (|median log2FC|<1 drop)
+# -> ✅ Stats switched to:
+#      (1) CFA vs Control
+#      (2) EAE vs Control
+#    Keep genera with p <= 0.1 in EITHER contrast
+#    Stars only for p < 0.05
+# -> Split half-violin + half-boxplot (CFA LEFT / EAE RIGHT) + stars
+# -> Legend: "CFA/PTX" vs "EAE"
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(tibble)
+  library(openxlsx)
+  library(ggplot2)
+  library(gghalves)
+  library(DESeq2)
+})
+
+# -------------------------
+# 0) Output folder
+# -------------------------
+out_dir <- "Genus Anaylsis"   # (typo preserved as you used)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------
+# 1) Inputs (auto-detect)
+# -------------------------
+family_selected_csv_candidates <- c(
+  file.path("26.01.14 - normalized_heatmap", "Family_log2FC_pval.filtered.ordered.DOWNTOP.csv"),
+  file.path("26.01.14 - normalized_heatmap", "Family_BothDown_CFA_and_EAE.csv"),
+  "Family_log2FC_pval.filtered.ordered.DOWNTOP.csv",
+  "Family_BothDown_CFA_and_EAE.csv"
+)
+in_family_selected_csv <- family_selected_csv_candidates[file.exists(family_selected_csv_candidates)][1]
+if (is.na(in_family_selected_csv)) stop("❌ Family 선택 결과 CSV를 찾지 못했습니다. 경로를 직접 지정하세요.")
+message("Using Family-selected CSV: ", in_family_selected_csv)
+
+genus_xlsx_candidates <- c(
+  "Taxonomy_abundance_count.xlsx",
+  "Taxonomy_abundance_count_Normailzation.xlsx",
+  file.path("26.01.14 Count Normalization.Family", "Taxonomy_abundance_count.xlsx"),
+  file.path("26.01.14 Count Normalization.Family", "DEG2 Nor Taxonomy_abundance_count.xlsx")
+)
+in_genus_xlsx <- genus_xlsx_candidates[file.exists(genus_xlsx_candidates)][1]
+if (is.na(in_genus_xlsx)) stop("❌ Genus 입력 엑셀을 찾지 못했습니다. 파일명을 직접 지정하세요.")
+message("Using Genus Excel: ", in_genus_xlsx)
+
+# -------------------------
+# 2) Parameters
+# -------------------------
+pseudo_count <- 1
+
+# ✅ p-value source for filtering/stars (DESeq2 결과)
+use_adj_p_for_star <- TRUE     # TRUE: padj(BH), FALSE: pvalue(raw)
+
+keep_p_cut <- 0.10             # keep genus if p<=0.1 in either contrast
+sig_cut1 <- 0.05
+sig_cut2 <- 0.01
+sig_cut3 <- 0.001
+
+# ✅ Effect-size filter on plotting log2FC (median-based)
+lfc_effect_cut <- 1
+effect_filter_mode <- "either_group"  # "either_group" or "group_diff"
+
+facet_by_family <- FALSE
+
+# ✅ Legend labels/colors
+legend_labels <- c("CFA/PTX", "EAE")
+names(legend_labels) <- c("CFA", "EAE")
+fill_map <- c(CFA = "firebrick3", EAE = "dodgerblue3")
+
+# -------------------------
+# 3) Utils
+# -------------------------
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+ord_by_num <- function(cols){
+  x <- str_replace_all(cols, "\\s+", "")
+  idx <- suppressWarnings(as.integer(str_extract(x, "\\d+$")))
+  cols[order(idx)]
+}
+
+pretty_rank <- function(x){
+  x <- as.character(x)
+  x <- gsub("^\\s+|\\s+$", "", x)
+  x <- gsub("^[a-z]__", "", x)
+  x <- gsub("^__+", "", x)
+  x <- gsub("[._-]\\d+$", "", x)
+  x <- gsub("^_+$", "", x)
+  trimws(x)
+}
+
+extract_rank_from_tax <- function(tax, prefix = "f__"){
+  tax <- as.character(tax)
+  pat1 <- paste0("(^|[;\\s])", stringr::fixed(prefix), "\\s*([^;\\|]+)")
+  out <- stringr::str_match(tax, pat1)[,3]
+  if (all(is.na(out))) {
+    if (prefix == "f__") out <- stringr::str_match(tax, "(?i)(family|fam)[:=]\\s*([^;\\|]+)")[,3]
+    if (prefix == "g__") out <- stringr::str_match(tax, "(?i)(genus|gen)[:=]\\s*([^;\\|]+)")[,3]
+  }
+  pretty_rank(out)
+}
+
+p_to_star_strict <- function(p){
+  ifelse(!is.finite(p) | is.na(p), "",
+         ifelse(p < sig_cut3, "***",
+                ifelse(p < sig_cut2, "**",
+                       ifelse(p < sig_cut1, "*", ""))))
+}
+
+# -------------------------
+# 4) Load selected families
+# -------------------------
+fam_df <- read.csv(in_family_selected_csv, stringsAsFactors = FALSE)
+fam_col <- c("Family_raw","Display","Family","Family_id")
+fam_col <- fam_col[fam_col %in% names(fam_df)][1]
+if (is.na(fam_col)) stop("❌ Family 선택 CSV에서 Family 컬럼을 찾지 못했습니다.")
+
+selected_families <- unique(pretty_rank(fam_df[[fam_col]]))
+selected_families <- selected_families[nzchar(selected_families) & !is.na(selected_families)]
+stopifnot(length(selected_families) > 0)
+
+write.csv(data.frame(Selected_Family = selected_families),
+          file.path(out_dir, "Selected_Families.used.csv"),
+          row.names = FALSE)
+
+# -------------------------
+# 5) Load Genus sheet
+# -------------------------
+sheets <- excel_sheets(in_genus_xlsx)
+sheet_genus <- if ("Genus" %in% sheets) "Genus" else {
+  hit <- sheets[str_detect(tolower(sheets), "genus")]
+  if (length(hit) == 0) sheets[1] else hit[1]
+}
+message("Using Genus sheet: ", sheet_genus)
+
+raw <- as.data.frame(read_excel(in_genus_xlsx, sheet = sheet_genus), stringsAsFactors = FALSE)
+
+# -------------------------
+# 6) Sample columns detect
+# -------------------------
+ctrl_cols <- grep("^(Con?tol|Control)\\s*\\d+$", names(raw), ignore.case = TRUE, value = TRUE)
+cfa_cols  <- grep("^CFA\\s*\\d+$",              names(raw), ignore.case = TRUE, value = TRUE)
+eae_cols  <- grep("^EAE\\s*\\d+$",              names(raw), ignore.case = TRUE, value = TRUE)
+
+if (length(ctrl_cols) == 0) stop("❌ Control 컬럼 못 찾음 (예: Control1~4 또는 Control 1~4)")
+if (length(cfa_cols)  == 0) stop("❌ CFA 컬럼 못 찾음 (예: CFA1~4 또는 CFA 1~4)")
+if (length(eae_cols)  == 0) stop("❌ EAE 컬럼 못 찾음 (예: EAE1~4 또는 EAE 1~4)")
+
+ctrl_cols <- ord_by_num(ctrl_cols)
+cfa_cols  <- ord_by_num(cfa_cols)
+eae_cols  <- ord_by_num(eae_cols)
+sample_cols <- c(ctrl_cols, cfa_cols, eae_cols)
+
+# -------------------------
+# 7) Determine taxonomy columns (Family/Genus)
+# -------------------------
+nm <- names(raw)
+col_family <- nm[str_detect(tolower(nm), "^family$|family_raw|family_id")][1]
+col_genus  <- nm[str_detect(tolower(nm), "^genus$|genus_raw|genus_id")][1]
+tax_candidates <- nm[str_detect(tolower(nm), "taxonomy|classification|lineage|taxon|otu|feature|asv")]
+col_tax <- tax_candidates[1] %||% nm[1]
+
+family_lab <- if (!is.na(col_family)) pretty_rank(raw[[col_family]]) else extract_rank_from_tax(raw[[col_tax]], "f__")
+genus_lab  <- if (!is.na(col_genus))  pretty_rank(raw[[col_genus]])  else extract_rank_from_tax(raw[[col_tax]], "g__")
+
+family_lab[family_lab == "" | is.na(family_lab)] <- NA_character_
+genus_lab[genus_lab == "" | is.na(genus_lab)]   <- NA_character_
+
+raw$Family_label <- family_lab
+raw$Genus_label  <- genus_lab
+
+if (all(is.na(raw$Genus_label))) stop("❌ Genus 라벨을 생성하지 못했습니다 (g__ 또는 Genus 컬럼 확인).")
+
+# -------------------------
+# 8) Filter: selected families only
+# -------------------------
+raw_f <- raw %>%
+  filter(!is.na(Family_label)) %>%
+  filter(Family_label %in% selected_families)
+
+if (nrow(raw_f) == 0) stop("❌ 선택된 Family에 해당하는 Genus가 0개입니다.")
+
+# -------------------------
+# 9) DESeq2: normalization + differential tests (CFA vs Control, EAE vs Control)
+# -------------------------
+cnt_df <- raw_f[, sample_cols, drop = FALSE]
+for (cc in names(cnt_df)) cnt_df[[cc]] <- to_num(cnt_df[[cc]])
+cnt_df[is.na(cnt_df)] <- 0
+
+mat <- as.matrix(cnt_df)
+storage.mode(mat) <- "numeric"
+mat[mat < 0] <- 0
+mat_int <- round(mat)
+
+rid <- raw_f$Genus_label
+rid[is.na(rid) | rid == ""] <- paste0("Genus_", seq_len(nrow(raw_f)))
+rid <- make.unique(rid)
+rownames(mat_int) <- rid
+colnames(mat_int) <- sample_cols
+
+grp <- factor(
+  c(rep("Control", length(ctrl_cols)), rep("CFA", length(cfa_cols)), rep("EAE", length(eae_cols))),
+  levels = c("Control","CFA","EAE")
+)
+coldata <- data.frame(row.names = sample_cols, group = grp)
+
+dds <- DESeqDataSetFromMatrix(countData = mat_int, colData = coldata, design = ~ group)
+
+# ✅ full DESeq2 run (sfType="poscounts" for microbiome count stability)
+dds <- DESeq(dds, sfType = "poscounts", quiet = TRUE)
+
+mat_norm <- counts(dds, normalized = TRUE)
+
+# export normalized counts
+norm_out_xlsx <- file.path(out_dir, "Genus_selected_DESeq2_normCounts.xlsx")
+wb <- createWorkbook()
+addWorksheet(wb, "Genus_normCounts_selected")
+writeData(wb, "Genus_normCounts_selected",
+          cbind(data.frame(Genus = rid, Family = raw_f$Family_label, stringsAsFactors = FALSE),
+                as.data.frame(mat_norm)))
+saveWorkbook(wb, norm_out_xlsx, overwrite = TRUE)
+
+# DESeq2 contrasts
+res_cfa <- as.data.frame(results(dds, contrast = c("group","CFA","Control")))
+res_eae <- as.data.frame(results(dds, contrast = c("group","EAE","Control")))
+res_cfa$Genus <- rownames(res_cfa)
+res_eae$Genus <- rownames(res_eae)
+
+# -------------------------
+# 10) per-sample log2FC vs Control mean (for plotting only)
+# -------------------------
+ctrl_idx <- which(grp == "Control")
+cfa_idx  <- which(grp == "CFA")
+eae_idx  <- which(grp == "EAE")
+
+ctrl_mean <- rowMeans(mat_norm[, ctrl_idx, drop = FALSE], na.rm = TRUE)
+
+log2fc_cfa_mat <- log2((mat_norm[, cfa_idx, drop = FALSE] + pseudo_count) / (ctrl_mean + pseudo_count))
+log2fc_eae_mat <- log2((mat_norm[, eae_idx, drop = FALSE] + pseudo_count) / (ctrl_mean + pseudo_count))
+
+df_long <- bind_rows(
+  as.data.frame(log2fc_cfa_mat) %>% mutate(Genus = rownames(log2fc_cfa_mat), Group = "CFA"),
+  as.data.frame(log2fc_eae_mat) %>% mutate(Genus = rownames(log2fc_eae_mat), Group = "EAE")
+) %>%
+  pivot_longer(cols = all_of(c(cfa_cols, eae_cols)), names_to = "Sample", values_to = "log2FC") %>%
+  mutate(
+    Group = factor(Group, levels = c("CFA","EAE")),
+    Genus = as.character(Genus)
+  )
+
+genus2fam <- data.frame(Genus = rid, Family = raw_f$Family_label, stringsAsFactors = FALSE)
+df_long <- left_join(df_long, genus2fam, by = "Genus")
+
+# -------------------------
+# 10.5) Effect-size filter (median-based on plotting log2FC)
+# -------------------------
+eff_tbl <- df_long %>%
+  group_by(Genus, Group) %>%
+  summarise(med = median(log2FC, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Group, values_from = med)
+
+if (effect_filter_mode == "either_group") {
+  eff_tbl <- eff_tbl %>%
+    mutate(abs_max_median = pmax(abs(CFA), abs(EAE), na.rm = TRUE),
+           keep = abs_max_median >= lfc_effect_cut)
+} else if (effect_filter_mode == "group_diff") {
+  eff_tbl <- eff_tbl %>%
+    mutate(abs_median_diff = abs(EAE - CFA),
+           keep = abs_median_diff >= lfc_effect_cut)
+} else stop("❌ effect_filter_mode는 'either_group' 또는 'group_diff'만 허용됩니다.")
+
+keep_genus_eff <- eff_tbl %>% filter(keep) %>% pull(Genus)
+
+write.csv(eff_tbl, file.path(out_dir, "Genus_effect_filter_table.csv"), row.names = FALSE)
+write.csv(data.frame(Genus = keep_genus_eff), file.path(out_dir, "Genus_kept_by_effect_cut.csv"), row.names = FALSE)
+
+df_long <- df_long %>% filter(Genus %in% keep_genus_eff)
+if (nrow(df_long) == 0) stop("❌ Effect filter 후 남는 Genus가 0개입니다. cut/mode를 조정하세요.")
+
+# -------------------------
+# 11) ✅ Stats (DESeq2): CFA vs Control & EAE vs Control
+#     Keep genus if either p<=0.1
+#     Stars only for p<0.05 (per contrast)
+# -------------------------
+stat_tbl <- full_join(
+  res_cfa %>%
+    transmute(
+      Genus,
+      log2FC_CFA_vs_Control = log2FoldChange,
+      p_raw_CFA_vs_Control  = pvalue,
+      p_adj_CFA_vs_Control  = padj
+    ),
+  res_eae %>%
+    transmute(
+      Genus,
+      log2FC_EAE_vs_Control = log2FoldChange,
+      p_raw_EAE_vs_Control  = pvalue,
+      p_adj_EAE_vs_Control  = padj
+    ),
+  by = "Genus"
+) %>%
+  left_join(genus2fam, by = "Genus") %>%
+  mutate(
+    p_use_CFA = if (isTRUE(use_adj_p_for_star)) p_adj_CFA_vs_Control else p_raw_CFA_vs_Control,
+    p_use_EAE = if (isTRUE(use_adj_p_for_star)) p_adj_EAE_vs_Control else p_raw_EAE_vs_Control
+  )
+
+# effect filter 통과한 genus만
+stat_tbl <- stat_tbl %>% filter(Genus %in% keep_genus_eff)
+
+# keep if either contrast passes p<=0.1
+stat_tbl_kept <- stat_tbl %>%
+  filter(
+    (is.finite(p_use_CFA) & !is.na(p_use_CFA) & p_use_CFA <= keep_p_cut) |
+      (is.finite(p_use_EAE) & !is.na(p_use_EAE) & p_use_EAE <= keep_p_cut)
+  ) %>%
+  mutate(
+    star_CFA = p_to_star_strict(p_use_CFA),
+    star_EAE = p_to_star_strict(p_use_EAE)
+  )
+
+keep_genus_p <- stat_tbl_kept$Genus
+df_long <- df_long %>% filter(Genus %in% keep_genus_p)
+if (nrow(df_long) == 0) stop("❌ p<=0.1 필터 후 남는 Genus가 0개입니다.")
+
+write.csv(stat_tbl_kept,
+          file.path(out_dir, "Genus_stats_DESeq2.CFA_vs_Control__EAE_vs_Control.p_le_0.1.csv"),
+          row.names = FALSE)
+write.csv(data.frame(Genus = keep_genus_p),
+          file.path(out_dir, "Genus_kept_by_p_le_0.1.either_contrast.csv"),
+          row.names = FALSE)
+
+# star y 위치
+y_pos_tbl <- df_long %>%
+  group_by(Genus) %>%
+  summarise(y_pos = max(log2FC, na.rm = TRUE), .groups = "drop") %>%
+  mutate(y_pos = y_pos + 0.12 * (max(y_pos, na.rm = TRUE) - min(y_pos, na.rm = TRUE) + 1e-6))
+
+ann_tbl <- stat_tbl_kept %>%
+  left_join(y_pos_tbl, by = "Genus")
+
+# order (still by median(EAE)-median(CFA) on plotting log2FC)
+ord <- df_long %>%
+  group_by(Genus, Group) %>%
+  summarise(med = median(log2FC, na.rm = TRUE), .groups="drop") %>%
+  pivot_wider(names_from = Group, values_from = med) %>%
+  mutate(diff = EAE - CFA) %>%
+  arrange(diff) %>%
+  pull(Genus)
+
+df_long$Genus <- factor(df_long$Genus, levels = ord)
+ann_tbl$Genus <- factor(ann_tbl$Genus, levels = ord)
+
+# -------------------------
+# 12) Plot (CFA LEFT / EAE RIGHT) + legend + per-contrast stars
+# -------------------------
+n_g <- nlevels(df_long$Genus)
+w_in <- max(10, min(0.35 * n_g + 4, 40))
+h_in <- 7
+
+out_tiff <- file.path(out_dir, "Genus_split_half_violin.log2FCvsControl.CFA_left_EAE_right.DESeq2_vsControl.p_le_0.1.tiff")
+
+p <- ggplot(df_long, aes(x = Genus, y = log2FC)) +
+  
+  # ---- CFA (LEFT) ----
+gghalves::geom_half_violin(
+  data = df_long %>% filter(Group == "CFA"),
+  aes(fill = Group),
+  side = "l", trim = FALSE, alpha = 0.95,
+  color = "black", linewidth = 0.3
+) +
+  gghalves::geom_half_boxplot(
+    data = df_long %>% filter(Group == "CFA"),
+    aes(fill = Group),
+    side = "l", width = 0.16, outlier.shape = NA,
+    color = "black", linewidth = 0.3
+  ) +
+  
+  # ---- EAE (RIGHT) ----
+gghalves::geom_half_violin(
+  data = df_long %>% filter(Group == "EAE"),
+  aes(fill = Group),
+  side = "r", trim = FALSE, alpha = 0.95,
+  color = "black", linewidth = 0.3
+) +
+  gghalves::geom_half_boxplot(
+    data = df_long %>% filter(Group == "EAE"),
+    aes(fill = Group),
+    side = "r", width = 0.16, outlier.shape = NA,
+    color = "black", linewidth = 0.3
+  ) +
+  
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.4) +
+  
+  # ✅ Stars: CFA vs Control (left-nudged)
+  geom_text(
+    data = ann_tbl,
+    aes(x = Genus, y = y_pos, label = star_CFA),
+    inherit.aes = FALSE,
+    position = position_nudge(x = -0.22),
+    vjust = 0, size = 4
+  ) +
+  # ✅ Stars: EAE vs Control (right-nudged)
+  geom_text(
+    data = ann_tbl,
+    aes(x = Genus, y = y_pos, label = star_EAE),
+    inherit.aes = FALSE,
+    position = position_nudge(x = +0.22),
+    vjust = 0, size = 4
+  ) +
+  
+  scale_fill_manual(
+    values = fill_map,
+    breaks = c("CFA","EAE"),
+    labels = unname(legend_labels[c("CFA","EAE")]),
+    name = NULL
+  ) +
+  
+  labs(
+    x = NULL,
+    y = sprintf(
+      "per-sample log2FC vs Control mean (pseudo=%g) | effect_cut=%.1f | keep p<=%.2f (either contrast) | stars<0.05\nStats: DESeq2 contrasts (CFA vs Control) & (EAE vs Control)",
+      pseudo_count, lfc_effect_cut, keep_p_cut
+    )
+  ) +
+  
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.margin = margin(10, 30, 10, 10),
+    legend.position = "right",
+    legend.key.height = unit(0.9, "lines"),
+    legend.spacing.y = unit(0.2, "lines")
+  ) +
+  coord_cartesian(clip = "off")
+
+if (isTRUE(facet_by_family)) {
+  p <- p + facet_wrap(~Family, scales = "free_x", nrow = 1)
+}
+
+grDevices::tiff(out_tiff, width = w_in, height = h_in, units = "in", res = 300, compression = "lzw")
+print(p)
+dev.off()
+
+# -------------------------
+# 13) Export plot input
+# -------------------------
+write.csv(df_long, file.path(out_dir, "Genus_plot_input.long.effectFiltered.p_le_0.1.csv"), row.names = FALSE)
+
+cat("\n===== DONE =====\n")
+cat("Output folder                 : ", normalizePath(out_dir, winslash="/", mustWork = FALSE), "\n", sep="")
+cat("Genus normalized XLSX         : ", normalizePath(norm_out_xlsx, winslash="/", mustWork = FALSE), "\n", sep="")
+cat("Effect filter table CSV       : ", normalizePath(file.path(out_dir, "Genus_effect_filter_table.csv"), winslash="/", mustWork = FALSE), "\n", sep="")
+cat("Kept genus by p<=0.1 CSV      : ", normalizePath(file.path(out_dir, "Genus_kept_by_p_le_0.1.either_contrast.csv"), winslash="/", mustWork = FALSE), "\n", sep="")
+cat("Stats (DESeq2 vs Control) CSV : ", normalizePath(file.path(out_dir, "Genus_stats_DESeq2.CFA_vs_Control__EAE_vs_Control.p_le_0.1.csv"), winslash="/", mustWork = FALSE), "\n", sep="")
+cat("Split half-violin TIFF        : ", normalizePath(out_tiff, winslash="/", mustWork = FALSE), "\n", sep="")
