@@ -1,0 +1,31 @@
+# =========================
+# Install dependencies
+# =========================
+
+# 1) CRAN packages
+cran_pkgs <- c(
+  "readxl","dplyr","tidyr","stringr","tibble",
+  "ggplot2","vegan","openxlsx","pheatmap"
+)
+install.packages(cran_pkgs)
+
+# 2) Bioconductor: DESeq2
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install("DESeq2")  # Bioconductor release must match your R version
+
+# 3) gghalves (choose ONE method)
+
+## (A) GitHub (recommended if CRAN install fails)
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+remotes::install_github("erocoar/gghalves")
+
+## (B) r-universe (often provides binaries; handy on Windows)
+# install.packages("gghalves", repos = c("https://erocoar.r-universe.dev", "https://cloud.r-project.org"))
+
+## (C) CRAN archive (source install; Windows는 Rtools 필요할 수 있음)
+# install.packages(
+#   "https://cran.r-project.org/src/contrib/Archive/gghalves/gghalves_0.1.4.tar.gz",
+#   repos = NULL, type = "source"
+# )
