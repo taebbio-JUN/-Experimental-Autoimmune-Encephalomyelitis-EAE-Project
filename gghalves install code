@@ -1,0 +1,87 @@
+# ============================
+# One-shot installer for gghalves
+# (tries r-universe -> GitHub -> CRAN Archive)
+# ============================
+local({
+  msg <- function(...) message(sprintf(...))
+  
+  # 0) Basic diagnostics
+  msg("R: %s", R.version.string)
+  msg("Platform: %s", R.version$platform)
+  
+  is_win <- identical(.Platform$OS.type, "windows")
+  
+  # 1) Set repos (r-universe first, then CRAN)
+  old_repos <- getOption("repos")
+  new_repos <- c(
+    "r-universe" = "https://erocoar.r-universe.dev",
+    "CRAN"       = "https://cloud.r-project.org"
+  )
+  options(repos = new_repos)
+  msg("Repos set to: %s", paste(names(getOption("repos")), collapse = ", "))
+  
+  # 2) Ensure helper packages
+  if (!requireNamespace("remotes", quietly = TRUE)) {
+    install.packages("remotes")
+  }
+  if (!requireNamespace("pkgbuild", quietly = TRUE)) {
+    install.packages("pkgbuild")
+  }
+  
+  # 3) Rtools check (Windows only) - cannot auto-install, but we can detect & guide
+  if (is_win) {
+    has_rt <- pkgbuild::has_rtools(debug = FALSE)
+    if (!isTRUE(has_rt)) {
+      msg("WARNING: Rtools not detected. If a source build is needed, install Rtools45 for R 4.5:")
+      msg("  https://cran.r-project.org/bin/windows/Rtools/")
+      msg("After installing Rtools, restart R/RStudio and re-run this script if needed.")
+    } else {
+      msg("Rtools detected ✅")
+    }
+  }
+  
+  # Helper: check success
+  ok <- function() requireNamespace("gghalves", quietly = TRUE)
+  
+  # 4) Attempt A: r-universe / CRAN repo install (best chance for binary)
+  if (!ok()) {
+    msg("Attempt A) install.packages('gghalves') from repos...")
+    tryCatch(
+      install.packages("gghalves"),
+      error = function(e) msg("Attempt A failed: %s", conditionMessage(e))
+    )
+  }
+  
+  # 5) Attempt B: GitHub install (often source build)
+  if (!ok()) {
+    msg("Attempt B) remotes::install_github('erocoar/gghalves') ...")
+    tryCatch(
+      remotes::install_github("erocoar/gghalves", upgrade = "never", build_vignettes = FALSE),
+      error = function(e) msg("Attempt B failed: %s", conditionMessage(e))
+    )
+  }
+  
+  # 6) Attempt C: CRAN Archive (source tar.gz)
+  if (!ok()) {
+    msg("Attempt C) CRAN Archive source install ...")
+    archive_url <- "https://cran.r-project.org/src/contrib/Archive/gghalves/gghalves_0.1.4.tar.gz"
+    tryCatch(
+      install.packages(archive_url, repos = NULL, type = "source"),
+      error = function(e) msg("Attempt C failed: %s", conditionMessage(e))
+    )
+  }
+  
+  # 7) Final check
+  if (ok()) {
+    msg("SUCCESS ✅ gghalves installed.")
+    suppressPackageStartupMessages(library(gghalves))
+  } else {
+    msg("FAILED ❌ gghalves could not be installed with all methods.")
+    if (is_win) {
+      msg("Most common fix on Windows: install Rtools45, restart R/RStudio, then re-run this script.")
+    }
+  }
+  
+  # Restore repos (optional)
+  options(repos = old_repos)
+})
